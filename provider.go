@@ -2,10 +2,12 @@ package cloudns
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/libdns/libdns"
 	"strings"
 	"time"
+
+	"github.com/libdns/libdns"
 )
 
 // ClouDNS API docs: https://www.cloudns.net/wiki/article/41/
@@ -33,7 +35,7 @@ const (
 
 // Provider facilitates DNS record manipulation with ClouDNS.
 type Provider struct {
-	AuthId                   string        `json:"auth_id"`
+	AuthId                   string        `json:"auth_id,omitempty"`
 	SubAuthId                string        `json:"sub_auth_id,omitempty"`
 	AuthPassword             string        `json:"auth_password"`
 	PropagationTimeout       time.Duration `json:"propagation_timeout,omitempty"`
@@ -46,18 +48,16 @@ type Provider struct {
 
 // GetRecords lists all the records in the zone.
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
-	if strings.HasSuffix(zone, ".") {
-		zone = strings.TrimSuffix(zone, ".")
-	}
+	zone = strings.TrimSuffix(zone, ".")
 
 	// Use retry mechanism for the GetRecords operation
 	var records []libdns.Record
 	err := RetryWithBackoff(ctx, func() error {
-		var err error
-		records, err = UseClient(p.AuthId, p.SubAuthId, p.AuthPassword).GetRecords(ctx, zone)
-		return err
-	}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
+		var e error
 
+		records, e = UseClient(p.AuthId, p.SubAuthId, p.AuthPassword).GetRecords(ctx, zone)
+		return e
+	}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get records after retries: %w", err)
 	}
@@ -68,34 +68,33 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 // AppendRecords adds records to the zone. It returns the records that were added.
 // It also verifies that the records have properly propagated to DNS servers.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	if strings.HasSuffix(zone, ".") {
-		zone = strings.TrimSuffix(zone, ".")
-	}
+	zone = strings.TrimSuffix(zone, ".")
 
-	var createdRecords []libdns.Record
+	createdRecords := make([]libdns.Record, 0, cap(records))
 	for _, record := range records {
 		// Use retry mechanism for the AddRecord operation
-		var r *libdns.Record
+		var r libdns.Record
 		err := RetryWithBackoff(ctx, func() error {
 			var err error
-			r, err = UseClient(p.AuthId, p.SubAuthId, p.AuthPassword).AddRecord(ctx, zone, record.Type, record.Name, record.Value, record.TTL)
+			r, err = UseClient(p.AuthId, p.SubAuthId, p.AuthPassword).AddRecord(ctx, zone, fromLibdnsRecord(record, ""))
+
 			return err
 		}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
-
 		if err != nil {
-			return nil, fmt.Errorf("failed to add record after retries: %w", err)
+			return nil, fmt.Errorf("failed to add record %q: %w", record.RR().Name, err)
 		}
 
-		createdRecords = append(createdRecords, *r)
+		createdRecords = append(createdRecords, r)
 
 		// For TXT records (commonly used for ACME challenges), verify DNS propagation
-		if record.Type == "TXT" {
+		rr := record.RR()
+		if rr.Type == "TXT" {
 			// Create a context with timeout for propagation verification
 			propagationCtx, cancel := context.WithTimeout(ctx, p.getPropagationTimeout())
 			defer cancel()
 
 			// Construct the FQDN for the record
-			fqdn := record.Name
+			fqdn := rr.Name
 			if fqdn != "" && fqdn != "@" {
 				fqdn = fqdn + "." + zone
 			} else {
@@ -106,12 +105,11 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 			err = VerifyDNSPropagation(
 				propagationCtx,
 				fqdn,
-				record.Type,
-				record.Value,
+				rr.Type,
+				rr.Data,
 				p.getPropagationRetries(),
 				p.getPropagationRetryInterval(),
 			)
-
 			if err != nil {
 				return nil, fmt.Errorf("DNS propagation verification failed for %s: %w", fqdn, err)
 			}
@@ -121,52 +119,48 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 	return createdRecords, nil
 }
 
-// SetRecords sets the records in the zone, either by updating existing records or creating new ones.
-// It returns the updated records and verifies that the records have properly propagated to DNS servers.
-func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	if strings.HasSuffix(zone, ".") {
-		zone = strings.TrimSuffix(zone, ".")
+func (p *Provider) processOperation(ctx context.Context, c *Client, zone string, oplist operationEntry) (libdns.Record, error) {
+	var (
+		r   libdns.Record
+		err error
+	)
+
+	switch oplist.op {
+	case addRecord:
+		err = RetryWithBackoff(ctx, func() error {
+			var e error
+			r, e = c.AddRecord(ctx, zone, oplist.record)
+
+			return e
+		}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
+
+	case modifyRecord:
+		err = RetryWithBackoff(ctx, func() error {
+			var e error
+			r, e = c.UpdateRecord(ctx, zone, oplist.record)
+
+			return e
+		}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
+	case deleteRecord:
+		err = RetryWithBackoff(ctx, func() error {
+			var e error
+			r, e = nil, c.DeleteRecord(ctx, zone, oplist.record.Id)
+
+			return e
+		}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
+	default:
+		return nil, fmt.Errorf("unknown operation: %v", oplist.op)
 	}
 
-	var updatedRecords []libdns.Record
-	for _, record := range records {
-		var r *libdns.Record
-		var err error
-
-		if len(record.ID) == 0 {
-			// Create new record with retry mechanism
-			err = RetryWithBackoff(ctx, func() error {
-				var opErr error
-				r, opErr = UseClient(p.AuthId, p.SubAuthId, p.AuthPassword).AddRecord(ctx, zone, record.Type, record.Name, record.Value, record.TTL)
-				return opErr
-			}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to add record after retries: %w", err)
-			}
-		} else {
-			// Update existing record with retry mechanism
-			err = RetryWithBackoff(ctx, func() error {
-				var opErr error
-				r, opErr = UseClient(p.AuthId, p.SubAuthId, p.AuthPassword).UpdateRecord(ctx, zone, record.ID, record.Name, record.Value, record.TTL)
-				return opErr
-			}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to update record after retries: %w", err)
-			}
-		}
-
-		updatedRecords = append(updatedRecords, *r)
-
+	if oplist.op == addRecord || oplist.op == modifyRecord {
 		// For TXT records (commonly used for ACME challenges), verify DNS propagation
-		if record.Type == "TXT" {
+		if oplist.record.Type == "TXT" {
 			// Create a context with timeout for propagation verification
 			propagationCtx, cancel := context.WithTimeout(ctx, p.getPropagationTimeout())
 			defer cancel()
 
 			// Construct the FQDN for the record
-			fqdn := record.Name
+			fqdn := oplist.record.Host
 			if fqdn != "" && fqdn != "@" {
 				fqdn = fqdn + "." + zone
 			} else {
@@ -177,43 +171,106 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			err = VerifyDNSPropagation(
 				propagationCtx,
 				fqdn,
-				record.Type,
-				record.Value,
+				oplist.record.Type,
+				oplist.record.Record,
 				p.getPropagationRetries(),
 				p.getPropagationRetryInterval(),
 			)
-
 			if err != nil {
 				return nil, fmt.Errorf("DNS propagation verification failed for %s: %w", fqdn, err)
 			}
 		}
 	}
 
-	return updatedRecords, nil
+	return r, err
+}
+
+// SetRecords sets the records in the zone, either by updating existing records or creating new ones.
+// ClouDNS does not offer an atomic update, so updates here can leave the zone
+// in an inconsistent state upon error. No rollback is attempted.
+//
+// All updates are attempted, even if an error is encountered. All successfully
+// updated records are returned.
+func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	zone = strings.TrimSuffix(zone, ".")
+
+	c := UseClient(p.AuthId, p.SubAuthId, p.AuthPassword)
+	upstreamRecords, err := c.GetClouDNSRecords(ctx, zone)
+	if err != nil {
+		return nil, fmt.Errorf("Could not get records for zone %q: %w", zone, err)
+	}
+
+	ret := make([]libdns.Record, 0, cap(records))
+	var retErr error
+	existing := clouDNSRecordsToMap(upstreamRecords)
+	rrsets := libdnsRecordsToMap(records)
+	oplist := makeOperationList(rrsets, existing)
+
+	for _, op := range oplist {
+		rec, err := p.processOperation(ctx, c, zone, op)
+		retErr = errors.Join(retErr, err)
+		if rec != nil {
+			ret = append(ret, rec)
+		}
+	}
+
+	return ret, retErr
+}
+
+func matchDeleteTarget(target, matched libdns.Record) bool {
+	matchedRR := matched.RR()
+	targetRR := target.RR()
+
+	if targetRR.Type != "" && targetRR.Type != matchedRR.Type {
+		return false
+	}
+
+	if targetRR.TTL != 0 && targetRR.TTL != matchedRR.TTL {
+		return false
+	}
+
+	if targetRR.Data != "" && targetRR.Data != matchedRR.Data {
+		return false
+	}
+
+	return true
 }
 
 // DeleteRecords deletes the records from the zone. It returns the records that were deleted.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	if strings.HasSuffix(zone, ".") {
-		zone = strings.TrimSuffix(zone, ".")
+	zone = strings.TrimSuffix(zone, ".")
+
+	c := UseClient(p.AuthId, p.SubAuthId, p.AuthPassword)
+	upstreamRecords, err := c.GetClouDNSRecords(ctx, zone)
+	if err != nil {
+		return nil, fmt.Errorf("Could not get records for zone %q: %w", zone, err)
 	}
+
+	keyedRecords := clouDNSRecordsToMap(upstreamRecords)
 
 	var deletedRecords []libdns.Record
 	for _, record := range records {
-		// Use retry mechanism for the DeleteRecord operation
-		var r *libdns.Record
-		err := RetryWithBackoff(ctx, func() error {
-			var err error
-			r, err = UseClient(p.AuthId, p.SubAuthId, p.AuthPassword).DeleteRecord(ctx, zone, record.ID)
-			return err
-		}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
+		rr := record.RR()
+		matchingRecords := keyedRecords[nameAndType{name: rr.Name, type_: rr.Type}]
+		for _, matchingRecord := range matchingRecords {
+			matchedLibdnsRecord, err := matchingRecord.toLibdnsRecord()
+			if err != nil {
+				return nil, err
+			}
 
-		if err != nil {
-			return nil, fmt.Errorf("failed to delete record after retries: %w", err)
-		}
+			if !matchDeleteTarget(record, matchedLibdnsRecord) {
+				continue
+			}
 
-		if r != nil {
-			deletedRecords = append(deletedRecords, *r)
+			// Use retry mechanism for the DeleteRecord operation
+			err = RetryWithBackoff(ctx, func() error {
+				return c.DeleteRecord(ctx, zone, matchingRecord.Id)
+			}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
+			if err != nil {
+				return nil, fmt.Errorf("failed to delete record %q: %w", matchingRecord.Host, err)
+			}
+
+			deletedRecords = append(deletedRecords, matchedLibdnsRecord)
 		}
 	}
 
