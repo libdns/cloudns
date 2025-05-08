@@ -6,14 +6,9 @@ import (
 	"fmt"
 	"net"
 	"time"
-)
 
-// parseDuration converts a string to a time.Duration, ignoring errors.
-// This is used for converting TTL values from the API response.
-func parseDuration(s string) time.Duration {
-	d, _ := time.ParseDuration(s)
-	return d
-}
+	"github.com/libdns/libdns"
+)
 
 // Rounds the given TTL in seconds to the next accepted value.
 // Accepted TTL values are:
@@ -176,4 +171,40 @@ func RetryWithBackoff(ctx context.Context, operation func() error, maxRetries in
 	}
 
 	return err
+}
+
+type nameAndType struct {
+	name  string
+	type_ string
+}
+
+// clouDNSRecordsToMap turns a slice of raw upstream results into a map indexed
+// by a the name and type of the record
+func clouDNSRecordsToMap(recs []ApiDnsRecord) map[nameAndType][]ApiDnsRecord {
+	ret := make(map[nameAndType][]ApiDnsRecord)
+	for _, res := range recs {
+		k := nameAndType{name: res.Host, type_: res.Type}
+		if _, ok := ret[k]; !ok {
+			ret[k] = []ApiDnsRecord{res}
+		} else {
+			ret[k] = append(ret[k], res)
+		}
+	}
+
+	return ret
+}
+
+func libdnsRecordsToMap(recs []libdns.Record) map[nameAndType][]libdns.RR {
+	ret := make(map[nameAndType][]libdns.RR)
+	for _, res := range recs {
+		rr := res.RR()
+		k := nameAndType{name: rr.Name, type_: rr.Type}
+		if _, ok := ret[k]; !ok {
+			ret[k] = []libdns.RR{rr}
+		} else {
+			ret[k] = append(ret[k], rr)
+		}
+	}
+
+	return ret
 }
