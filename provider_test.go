@@ -2,9 +2,14 @@ package cloudns
 
 import (
 	"context"
-	"github.com/libdns/libdns"
+	"iter"
+	"net/netip"
+	"reflect"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/libdns/libdns"
 )
 
 var (
@@ -14,13 +19,39 @@ var (
 	TZone         = ""
 )
 
+func zip[T any, U any](first iter.Seq[T], second iter.Seq[U]) iter.Seq2[T, U] {
+	return func(yield func(T, U) bool) {
+		firstIter, firstStop := iter.Pull(first)
+		defer firstStop()
+		secondIter, secondStop := iter.Pull(second)
+		defer secondStop()
+
+		for {
+			f, fok := firstIter()
+			s, sok := secondIter()
+
+			if !fok && !sok {
+				return
+			}
+
+			if (!fok && sok) || (fok && !sok) {
+				panic("uneven iterators")
+			}
+
+			if !yield(f, s) {
+				return
+			}
+		}
+	}
+}
+
 func TestGetRecords(t *testing.T) {
 	provider := &Provider{
 		AuthId:       TAuthId,
 		SubAuthId:    TSubAuthId,
 		AuthPassword: TAuthPassword,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	records, err := provider.GetRecords(ctx, TZone)
@@ -33,7 +64,7 @@ func TestGetRecords(t *testing.T) {
 	}
 
 	for _, record := range records {
-		if record.ID == "" || record.Type == "" || record.Value == "" {
+		if record.RR().Type == "" || record.RR().Data == "" {
 			t.Errorf("Incomplete record data: %+v", record)
 		}
 		t.Logf("Record: %+v", record)
@@ -46,30 +77,75 @@ func TestAppendRecords(t *testing.T) {
 		SubAuthId:    TSubAuthId,
 		AuthPassword: TAuthPassword,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	// Prepare a record to append
-	record := libdns.Record{
-		Type:  "TXT",
-		Name:  "test",
-		Value: "test-value",
-		TTL:   300 * time.Second,
+	records := []libdns.Record{
+		libdns.Address{
+			Name: "test",
+			TTL:  300 * time.Second,
+			IP:   netip.MustParseAddr("127.0.0.1"),
+		},
+		libdns.Address{
+			Name: "test",
+			TTL:  300 * time.Second,
+			IP:   netip.MustParseAddr("::1"),
+		},
+		libdns.CAA{
+			Name:  "test",
+			TTL:   300 * time.Second,
+			Flags: 0,
+			Tag:   "issue",
+			Value: "bar",
+		},
+		libdns.CNAME{
+			Name:   "test-cname",
+			TTL:    300 * time.Second,
+			Target: "example.com",
+		},
+		libdns.MX{
+			Name:       "test-mx",
+			TTL:        300 * time.Second,
+			Preference: 1,
+			Target:     "example.com",
+		},
+		libdns.NS{
+			Name:   "test-ns",
+			TTL:    300 * time.Second,
+			Target: "example.com",
+		},
+		libdns.SRV{
+			Service:   "http",
+			Transport: "tcp",
+			Name:      "test",
+			TTL:       300 * time.Second,
+			Priority:  1,
+			Weight:    1,
+			Port:      1,
+			Target:    "example.com",
+		},
+		libdns.TXT{
+			Name: "test",
+			TTL:  300 * time.Second,
+			Text: "test-value",
+		},
 	}
 
 	// Append the record
-	addedRecords, err := provider.AppendRecords(ctx, TZone, []libdns.Record{record})
+	addedRecords, err := provider.AppendRecords(ctx, TZone, records)
 	if err != nil {
 		t.Fatalf("Failed to append records: %s", err)
 	}
 
-	if len(addedRecords) != 1 {
-		t.Fatalf("Expected 1 record to be added, got %d", len(addedRecords))
+	if len(addedRecords) != len(records) {
+		t.Fatalf("Expected %d record to be added, got %d", len(records), len(addedRecords))
 	}
 
 	// Validate the added record
-	addedRecord := addedRecords[0]
-	if addedRecord.Type != record.Type || addedRecord.Name != record.Name || addedRecord.Value != record.Value || addedRecord.TTL != record.TTL {
-		t.Errorf("Record data mismatch: expected %+v, got %+v", record, addedRecord)
+	for addedRecord, record := range zip(slices.Values(addedRecords), slices.Values(records)) {
+		if !reflect.DeepEqual(record.RR(), addedRecord.RR()) {
+			t.Errorf("Record data mismatch: expected %+v, got %+v", record, addedRecord)
+		}
 	}
 
 	// Clean up the added record
@@ -86,15 +162,14 @@ func TestSetRecords(t *testing.T) {
 		AuthPassword: TAuthPassword,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	// Prepare a record to set
-	record := libdns.Record{
-		Type:  "TXT",
-		Name:  "test-set",
-		Value: "test-value",
-		TTL:   300 * time.Second,
+	record := libdns.TXT{
+		Name: "test-set",
+		Text: "test-value",
+		TTL:  300 * time.Second,
 	}
 
 	// Append the record to set
@@ -105,8 +180,12 @@ func TestSetRecords(t *testing.T) {
 
 	// Set the record
 	updatedValue := "updated-value"
-	updatedRecord := addedRecords[0]
-	updatedRecord.Value = updatedValue
+	updatedRecord, ok := addedRecords[0].(libdns.TXT)
+	if !ok {
+		t.Fatalf("Return value is not a TXT record: %v", addedRecords[0])
+	}
+
+	updatedRecord.Text = updatedValue
 
 	setRecords, err := provider.SetRecords(ctx, TZone, []libdns.Record{updatedRecord})
 	if err != nil {
@@ -119,7 +198,7 @@ func TestSetRecords(t *testing.T) {
 
 	// Validate the updated record
 	setRecord := setRecords[0]
-	if setRecord.Type != updatedRecord.Type || setRecord.Name != updatedRecord.Name || setRecord.Value != updatedRecord.Value || setRecord.TTL != updatedRecord.TTL {
+	if !reflect.DeepEqual(setRecord.RR(), updatedRecord.RR()) {
 		t.Errorf("Record data mismatch: expected %+v, got %+v", updatedRecord, setRecord)
 	}
 
