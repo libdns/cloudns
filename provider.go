@@ -14,15 +14,6 @@ import (
 
 // Default configuration values for DNS operations
 const (
-	// DefaultPropagationTimeout is the default timeout for DNS propagation verification
-	DefaultPropagationTimeout = 5 * time.Minute
-
-	// DefaultPropagationRetries is the default number of retries for DNS propagation verification
-	DefaultPropagationRetries = 60
-
-	// DefaultPropagationRetryInterval is the default interval between retries for DNS propagation verification
-	DefaultPropagationRetryInterval = 5 * time.Second
-
 	// DefaultOperationRetries is the default number of retries for DNS operations
 	DefaultOperationRetries = 5
 
@@ -35,15 +26,12 @@ const (
 
 // Provider facilitates DNS record manipulation with ClouDNS.
 type Provider struct {
-	AuthId                   string        `json:"auth_id,omitempty"`
-	SubAuthId                string        `json:"sub_auth_id,omitempty"`
-	AuthPassword             string        `json:"auth_password"`
-	PropagationTimeout       time.Duration `json:"propagation_timeout,omitempty"`
-	PropagationRetries       int           `json:"propagation_retries,omitempty"`
-	PropagationRetryInterval time.Duration `json:"propagation_retry_interval,omitempty"`
-	OperationRetries         int           `json:"operation_retries,omitempty"`
-	InitialBackoff           time.Duration `json:"initial_backoff,omitempty"`
-	MaxBackoff               time.Duration `json:"max_backoff,omitempty"`
+	AuthId           string        `json:"auth_id,omitempty"`
+	SubAuthId        string        `json:"sub_auth_id,omitempty"`
+	AuthPassword     string        `json:"auth_password"`
+	OperationRetries int           `json:"operation_retries,omitempty"`
+	InitialBackoff   time.Duration `json:"initial_backoff,omitempty"`
+	MaxBackoff       time.Duration `json:"max_backoff,omitempty"`
 }
 
 // GetRecords lists all the records in the zone.
@@ -66,7 +54,6 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 }
 
 // AppendRecords adds records to the zone. It returns the records that were added.
-// It also verifies that the records have properly propagated to DNS servers.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	zone = strings.TrimSuffix(zone, ".")
 
@@ -85,35 +72,6 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		}
 
 		createdRecords = append(createdRecords, r)
-
-		// For TXT records (commonly used for ACME challenges), verify DNS propagation
-		rr := record.RR()
-		if rr.Type == "TXT" {
-			// Create a context with timeout for propagation verification
-			propagationCtx, cancel := context.WithTimeout(ctx, p.getPropagationTimeout())
-			defer cancel()
-
-			// Construct the FQDN for the record
-			fqdn := rr.Name
-			if fqdn != "" && fqdn != "@" {
-				fqdn = fqdn + "." + zone
-			} else {
-				fqdn = zone
-			}
-
-			// Verify that the record has propagated
-			err = VerifyDNSPropagation(
-				propagationCtx,
-				fqdn,
-				rr.Type,
-				rr.Data,
-				p.getPropagationRetries(),
-				p.getPropagationRetryInterval(),
-			)
-			if err != nil {
-				return nil, fmt.Errorf("DNS propagation verification failed for %s: %w", fqdn, err)
-			}
-		}
 	}
 
 	return createdRecords, nil
@@ -150,36 +108,6 @@ func (p *Provider) processOperation(ctx context.Context, c *Client, zone string,
 		}, p.getOperationRetries(), p.getInitialBackoff(), p.getMaxBackoff())
 	default:
 		return nil, fmt.Errorf("unknown operation: %v", oplist.op)
-	}
-
-	if oplist.op == addRecord || oplist.op == modifyRecord {
-		// For TXT records (commonly used for ACME challenges), verify DNS propagation
-		if oplist.record.Type == "TXT" {
-			// Create a context with timeout for propagation verification
-			propagationCtx, cancel := context.WithTimeout(ctx, p.getPropagationTimeout())
-			defer cancel()
-
-			// Construct the FQDN for the record
-			fqdn := oplist.record.Host
-			if fqdn != "" && fqdn != "@" {
-				fqdn = fqdn + "." + zone
-			} else {
-				fqdn = zone
-			}
-
-			// Verify that the record has propagated
-			err = VerifyDNSPropagation(
-				propagationCtx,
-				fqdn,
-				oplist.record.Type,
-				oplist.record.Record,
-				p.getPropagationRetries(),
-				p.getPropagationRetryInterval(),
-			)
-			if err != nil {
-				return nil, fmt.Errorf("DNS propagation verification failed for %s: %w", fqdn, err)
-			}
-		}
 	}
 
 	return r, err
@@ -278,30 +206,6 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 }
 
 // Helper methods to get configuration values with defaults
-
-// getPropagationTimeout returns the configured propagation timeout or the default value
-func (p *Provider) getPropagationTimeout() time.Duration {
-	if p.PropagationTimeout <= 0 {
-		return DefaultPropagationTimeout
-	}
-	return p.PropagationTimeout
-}
-
-// getPropagationRetries returns the configured propagation retries or the default value
-func (p *Provider) getPropagationRetries() int {
-	if p.PropagationRetries <= 0 {
-		return DefaultPropagationRetries
-	}
-	return p.PropagationRetries
-}
-
-// getPropagationRetryInterval returns the configured propagation retry interval or the default value
-func (p *Provider) getPropagationRetryInterval() time.Duration {
-	if p.PropagationRetryInterval <= 0 {
-		return DefaultPropagationRetryInterval
-	}
-	return p.PropagationRetryInterval
-}
 
 // getOperationRetries returns the configured operation retries or the default value
 func (p *Provider) getOperationRetries() int {
