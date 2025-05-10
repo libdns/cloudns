@@ -2,9 +2,7 @@ package cloudns
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/libdns/libdns"
@@ -36,90 +34,6 @@ func ttlRounder(ttl time.Duration) int {
 	}
 
 	return 2592000
-}
-
-// VerifyDNSPropagation checks if a DNS record has properly propagated by querying
-// multiple DNS servers. It retries the verification until the record is found or
-// the context is canceled.
-//
-// Parameters:
-//   - ctx: Context for timeout and cancellation
-//   - fqdn: Fully qualified domain name of the record to verify (including the host part)
-//   - recordType: Type of the DNS record (e.g., "TXT")
-//   - expectedValue: Expected value of the DNS record
-//   - maxRetries: Maximum number of retry attempts
-//   - retryInterval: Time to wait between retry attempts
-//
-// Returns:
-//   - error: nil if the record has propagated correctly, otherwise an error
-func VerifyDNSPropagation(ctx context.Context, fqdn string, recordType string, expectedValue string, maxRetries int, retryInterval time.Duration) error {
-	// List of public DNS servers to query
-	dnsServers := []string{
-		"8.8.8.8:53",        // Google
-		"1.1.1.1:53",        // Cloudflare
-		"9.9.9.9:53",        // Quad9
-		"208.67.222.222:53", // OpenDNS
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Check if context is canceled
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			// Continue with verification
-		}
-
-		// Try each DNS server
-		for _, server := range dnsServers {
-			r := &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 5 * time.Second}
-					return d.DialContext(ctx, "udp", server)
-				},
-			}
-
-			// For TXT records
-			if recordType == "TXT" {
-				txtRecords, err := r.LookupTXT(ctx, fqdn)
-				if err != nil {
-					lastErr = err
-					continue
-				}
-
-				for _, txt := range txtRecords {
-					if txt == expectedValue {
-						return nil // Record found and matches expected value
-					}
-				}
-
-				lastErr = fmt.Errorf("TXT record found but value doesn't match: expected %s", expectedValue)
-			} else {
-				// For other record types, just check if the domain resolves
-				_, err := r.LookupHost(ctx, fqdn)
-				if err != nil {
-					lastErr = err
-					continue
-				}
-				return nil // Domain resolves
-			}
-		}
-
-		// Wait before retrying
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(retryInterval):
-			// Continue with next attempt
-		}
-	}
-
-	if lastErr != nil {
-		return fmt.Errorf("DNS propagation verification failed after %d attempts: %w", maxRetries, lastErr)
-	}
-	return errors.New("DNS propagation verification failed: record not found or doesn't match expected value")
 }
 
 // RetryWithBackoff executes the given function with exponential backoff retry logic.
