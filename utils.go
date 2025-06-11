@@ -2,18 +2,11 @@ package cloudns
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net"
 	"time"
-)
 
-// parseDuration converts a string to a time.Duration, ignoring errors.
-// This is used for converting TTL values from the API response.
-func parseDuration(s string) time.Duration {
-	d, _ := time.ParseDuration(s)
-	return d
-}
+	"github.com/libdns/libdns"
+)
 
 // Rounds the given TTL in seconds to the next accepted value.
 // Accepted TTL values are:
@@ -41,90 +34,6 @@ func ttlRounder(ttl time.Duration) int {
 	}
 
 	return 2592000
-}
-
-// VerifyDNSPropagation checks if a DNS record has properly propagated by querying
-// multiple DNS servers. It retries the verification until the record is found or
-// the context is canceled.
-//
-// Parameters:
-//   - ctx: Context for timeout and cancellation
-//   - fqdn: Fully qualified domain name of the record to verify (including the host part)
-//   - recordType: Type of the DNS record (e.g., "TXT")
-//   - expectedValue: Expected value of the DNS record
-//   - maxRetries: Maximum number of retry attempts
-//   - retryInterval: Time to wait between retry attempts
-//
-// Returns:
-//   - error: nil if the record has propagated correctly, otherwise an error
-func VerifyDNSPropagation(ctx context.Context, fqdn string, recordType string, expectedValue string, maxRetries int, retryInterval time.Duration) error {
-	// List of public DNS servers to query
-	dnsServers := []string{
-		"8.8.8.8:53",        // Google
-		"1.1.1.1:53",        // Cloudflare
-		"9.9.9.9:53",        // Quad9
-		"208.67.222.222:53", // OpenDNS
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Check if context is canceled
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			// Continue with verification
-		}
-
-		// Try each DNS server
-		for _, server := range dnsServers {
-			r := &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 5 * time.Second}
-					return d.DialContext(ctx, "udp", server)
-				},
-			}
-
-			// For TXT records
-			if recordType == "TXT" {
-				txtRecords, err := r.LookupTXT(ctx, fqdn)
-				if err != nil {
-					lastErr = err
-					continue
-				}
-
-				for _, txt := range txtRecords {
-					if txt == expectedValue {
-						return nil // Record found and matches expected value
-					}
-				}
-
-				lastErr = fmt.Errorf("TXT record found but value doesn't match: expected %s", expectedValue)
-			} else {
-				// For other record types, just check if the domain resolves
-				_, err := r.LookupHost(ctx, fqdn)
-				if err != nil {
-					lastErr = err
-					continue
-				}
-				return nil // Domain resolves
-			}
-		}
-
-		// Wait before retrying
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(retryInterval):
-			// Continue with next attempt
-		}
-	}
-
-	if lastErr != nil {
-		return fmt.Errorf("DNS propagation verification failed after %d attempts: %w", maxRetries, lastErr)
-	}
-	return errors.New("DNS propagation verification failed: record not found or doesn't match expected value")
 }
 
 // RetryWithBackoff executes the given function with exponential backoff retry logic.
@@ -176,4 +85,40 @@ func RetryWithBackoff(ctx context.Context, operation func() error, maxRetries in
 	}
 
 	return err
+}
+
+type nameAndType struct {
+	name  string
+	type_ string
+}
+
+// clouDNSRecordsToMap turns a slice of raw upstream results into a map indexed
+// by a the name and type of the record
+func clouDNSRecordsToMap(recs []ApiDnsRecord) map[nameAndType][]ApiDnsRecord {
+	ret := make(map[nameAndType][]ApiDnsRecord)
+	for _, res := range recs {
+		k := nameAndType{name: res.Host, type_: res.Type}
+		if _, ok := ret[k]; !ok {
+			ret[k] = []ApiDnsRecord{res}
+		} else {
+			ret[k] = append(ret[k], res)
+		}
+	}
+
+	return ret
+}
+
+func libdnsRecordsToMap(recs []libdns.Record) map[nameAndType][]libdns.RR {
+	ret := make(map[nameAndType][]libdns.RR)
+	for _, res := range recs {
+		rr := res.RR()
+		k := nameAndType{name: rr.Name, type_: rr.Type}
+		if _, ok := ret[k]; !ok {
+			ret[k] = []libdns.RR{rr}
+		} else {
+			ret[k] = append(ret[k], rr)
+		}
+	}
+
+	return ret
 }

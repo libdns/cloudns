@@ -3,15 +3,17 @@ package cloudns
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"github.com/libdns/libdns"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
-	"strconv"
-	"time"
+	"slices"
+
+	"github.com/libdns/libdns"
 )
+
+const success = "Success"
 
 type Client struct {
 	AuthId       string `json:"auth_id"`
@@ -30,21 +32,18 @@ func UseClient(authId, subAuthId, authPassword string) *Client {
 	}
 }
 
-// GetRecords retrieves all DNS records for the specified zone.
-// It handles API communication, response parsing, and error handling.
+// GetClouDNSRecords returns the raw upstream results from ClouDNS.
+// For use when the IDs of the individual records needs to be preserved, which
+// cannot be done with the generic libdns.Record interface.
 //
 // Parameters:
 //   - ctx: Context for timeout and cancellation
 //   - zone: The DNS zone (domain) to retrieve records from
 //
 // Returns:
-//   - []libdns.Record: Slice of all DNS records in the zone
+//   - []ApiDnsRecord: Slice of all DNS records in the zone
 //   - error: Any error that occurred during the operation
-func (c *Client) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
-	// Log the operation for debugging
-	fmt.Printf("Getting all records from zone %s\n", zone)
-
-	// Prepare the API endpoint and parameters
+func (c *Client) GetClouDNSRecords(ctx context.Context, zone string) ([]ApiDnsRecord, error) {
 	recordsEndpoint := apiBaseUrl.JoinPath("records.json")
 	params := map[string]string{
 		"domain-name": zone,
@@ -69,16 +68,25 @@ func (c *Client) GetRecords(ctx context.Context, zone string) ([]libdns.Record, 
 		return nil, fmt.Errorf("failed to decode API response: %w", err)
 	}
 
-	// Convert API records to libdns.Record format
+	return slices.Collect(maps.Values(apiResult)), nil
+}
+
+// GetRecords retrieves DNS records for the specified zone.
+// It returns a slice of libdns.Record or an error if the request fails.
+func (c *Client) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	apiResult, err := c.GetClouDNSRecords(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
 	records := make([]libdns.Record, 0, len(apiResult))
 	for _, recordData := range apiResult {
-		records = append(records, libdns.Record{
-			ID:    recordData.Id,
-			Type:  recordData.Type,
-			Name:  recordData.Host,
-			TTL:   parseDuration(recordData.Ttl + "s"),
-			Value: recordData.Record,
-		})
+		record, err := recordData.toLibdnsRecord()
+		if err != nil {
+			return nil, err
+		}
+
+		records = append(records, record)
 	}
 
 	// Log the number of records found
@@ -87,73 +95,22 @@ func (c *Client) GetRecords(ctx context.Context, zone string) ([]libdns.Record, 
 	return records, nil
 }
 
-// GetRecord retrieves a specific DNS record by its ID from the specified zone.
-// It first gets all records in the zone and then finds the one with the matching ID.
-//
-// Parameters:
-//   - ctx: Context for timeout and cancellation
-//   - zone: The DNS zone (domain) containing the record
-//   - recordID: ID of the record to retrieve
-//
-// Returns:
-//   - *libdns.Record: The matching record if found
-//   - error: "record not found" error if no matching record exists, or any other error that occurred
-func (c *Client) GetRecord(ctx context.Context, zone, recordID string) (*libdns.Record, error) {
-	// Log the operation for debugging
-	fmt.Printf("Getting record ID %s from zone %s\n", recordID, zone)
-
-	// Get all records in the zone
-	records, err := c.GetRecords(ctx, zone)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get records from zone %s: %w", zone, err)
-	}
-
-	// Find the record with the matching ID
-	for _, record := range records {
-		if record.ID == recordID {
-			return &record, nil
-		}
-	}
-
-	// No matching record found
-	return nil, errors.New("record not found")
-}
-
 // AddRecord creates a new DNS record in the specified zone with the given properties and returns the created record or an error.
 // It handles API communication, response parsing, and error handling.
 //
 // Parameters:
 //   - ctx: Context for timeout and cancellation
 //   - zone: The DNS zone (domain) to add the record to
-//   - recordType: Type of DNS record (e.g., "TXT", "A", "CNAME")
-//   - recordHost: Host part of the record (subdomain or @ for root)
-//   - recordValue: Value of the record (e.g., IP address for A records, domain for CNAME)
-//   - ttl: Time-to-live duration for the record
+//   - record: The DNS record to add
 //
 // Returns:
-//   - *libdns.Record: The created record with its assigned ID
+//   - libdns.Record: The created record
 //   - error: Any error that occurred during the operation
-func (c *Client) AddRecord(ctx context.Context, zone string, recordType string, recordHost string, recordValue string, ttl time.Duration) (*libdns.Record, error) {
+func (c *Client) AddRecord(ctx context.Context, zone string, record ApiDnsRecord) (libdns.Record, error) {
 	endpoint := apiBaseUrl.JoinPath("add-record.json")
 
-	// Round TTL to an accepted value
-	roundedTTL := ttlRounder(ttl)
-	roundedTTLStr := strconv.Itoa(roundedTTL)
-
-	// Prepare request parameters
-	params := map[string]string{
-		"domain-name": zone,
-		"record-type": recordType,
-		"host":        recordHost,
-		"record":      recordValue,
-		"ttl":         roundedTTLStr,
-	}
-
-	// Log the operation for debugging
-	fmt.Printf("Adding %s record: %s.%s with value %s and TTL %s\n",
-		recordType, recordHost, zone, recordValue, roundedTTLStr)
-
-	// Perform the API request
+	params := record.toParameters()
+	params["domain-name"] = zone
 	resp, err := c.performPostRequest(ctx, endpoint, params)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed: %w", err)
@@ -173,21 +130,11 @@ func (c *Client) AddRecord(ctx context.Context, zone string, recordType string, 
 	}
 
 	// Check if the operation was successful
-	if resultModel.Status != "Success" {
+	if resultModel.Status != success {
 		return nil, fmt.Errorf("API operation failed: %s", resultModel.StatusDescription)
 	}
 
-	// Convert TTL string to duration
-	parsedTTL := parseDuration(roundedTTLStr + "s")
-
-	// Create and return the record
-	return &libdns.Record{
-		ID:    strconv.Itoa(resultModel.Data.Id),
-		Type:  recordType,
-		Name:  recordHost,
-		TTL:   parsedTTL,
-		Value: recordValue,
-	}, nil
+	return record.toLibdnsRecord()
 }
 
 // UpdateRecord updates an existing DNS record in the specified zone with the provided values and returns the updated record.
@@ -196,35 +143,16 @@ func (c *Client) AddRecord(ctx context.Context, zone string, recordType string, 
 // Parameters:
 //   - ctx: Context for timeout and cancellation
 //   - zone: The DNS zone (domain) containing the record
-//   - recordID: ID of the record to update
-//   - host: New host part of the record (subdomain or @ for root)
-//   - recordValue: New value for the record
-//   - ttl: New time-to-live duration for the record
+//   - record: The record to update
 //
 // Returns:
-//   - *libdns.Record: The updated record
+//   - libdns.Record: The updated record
 //   - error: Any error that occurred during the operation
-func (c *Client) UpdateRecord(ctx context.Context, zone string, recordID string, host string, recordValue string, ttl time.Duration) (*libdns.Record, error) {
+func (c *Client) UpdateRecord(ctx context.Context, zone string, record ApiDnsRecord) (libdns.Record, error) {
 	updateEndpoint := apiBaseUrl.JoinPath("mod-record.json")
 
-	// Round TTL to an accepted value
-	ttlSec := ttlRounder(ttl)
-	ttlSecStr := strconv.Itoa(ttlSec)
-
-	// Prepare request parameters
-	params := map[string]string{
-		"domain-name": zone,
-		"record-id":   recordID,
-		"host":        host,
-		"record":      recordValue,
-		"ttl":         ttlSecStr,
-	}
-
-	// Log the operation for debugging
-	fmt.Printf("Updating record ID %s in zone %s: host=%s, value=%s, TTL=%s\n",
-		recordID, zone, host, recordValue, ttlSecStr)
-
-	// Perform the API request
+	params := record.toParameters()
+	params["domain-name"] = zone
 	resp, err := c.performPostRequest(ctx, updateEndpoint, params)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed: %w", err)
@@ -239,33 +167,24 @@ func (c *Client) UpdateRecord(ctx context.Context, zone string, recordID string,
 
 	// Parse the API response
 	var resultModel ApiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&resultModel); err != nil {
+	if err = json.NewDecoder(resp.Body).Decode(&resultModel); err != nil {
 		return nil, fmt.Errorf("failed to decode API response: %w", err)
 	}
 
 	// Check if the operation was successful
-	if resultModel.Status != "Success" {
+	if resultModel.Status != success {
 		return nil, fmt.Errorf("API operation failed: %s", resultModel.StatusDescription)
 	}
 
-	// Get the existing record to retrieve its type
-	existingRecord, err := c.GetRecord(ctx, zone, recordID)
+	ret, err := record.toLibdnsRecord()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get existing record details: %w", err)
 	}
 
-	// Create and return the updated record
-	return &libdns.Record{
-		ID:    recordID,
-		Type:  existingRecord.Type,
-		Name:  host,
-		TTL:   parseDuration(ttlSecStr + "s"),
-		Value: recordValue,
-	}, nil
+	return ret, nil
 }
 
 // DeleteRecord deletes a DNS record identified by its ID in the specified zone.
-// It first retrieves the record details to return them after deletion, then performs the delete operation.
 //
 // Parameters:
 //   - ctx: Context for timeout and cancellation
@@ -273,23 +192,9 @@ func (c *Client) UpdateRecord(ctx context.Context, zone string, recordID string,
 //   - recordId: ID of the record to delete
 //
 // Returns:
-//   - *libdns.Record: The deleted record, or nil if the record was not found
+//   - libdns.Record: The deleted record, or nil if the record was not found
 //   - error: Any error that occurred during the operation
-func (c *Client) DeleteRecord(ctx context.Context, zone string, recordId string) (*libdns.Record, error) {
-	// First get the record details so we can return them after deletion
-	rInfo, err := c.GetRecord(ctx, zone, recordId)
-	if err != nil {
-		if err.Error() == "record not found" {
-			// Record doesn't exist, nothing to delete
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to get record details before deletion: %w", err)
-	}
-
-	// Log the operation for debugging
-	fmt.Printf("Deleting record ID %s from zone %s\n", recordId, zone)
-
-	// Prepare the API endpoint and parameters
+func (c *Client) DeleteRecord(ctx context.Context, zone string, recordId string) error {
 	endpoint := apiBaseUrl.JoinPath("delete-record.json")
 	params := map[string]string{
 		"domain-name": zone,
@@ -299,29 +204,28 @@ func (c *Client) DeleteRecord(ctx context.Context, zone string, recordId string)
 	// Perform the API request
 	resp, err := c.performPostRequest(ctx, endpoint, params)
 	if err != nil {
-		return nil, fmt.Errorf("API request failed: %w", err)
+		return fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Check HTTP status code
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API returned non-OK status code %d: %s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("API returned non-OK status code %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	// Parse the API response
 	var resultModel ApiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&resultModel); err != nil {
-		return nil, fmt.Errorf("failed to decode API response: %w", err)
+		return fmt.Errorf("failed to decode API response: %w", err)
 	}
 
 	// Check if the operation was successful
-	if resultModel.Status != "Success" {
-		return nil, fmt.Errorf("API operation failed: %s", resultModel.StatusDescription)
+	if resultModel.Status != success {
+		return fmt.Errorf("API operation failed: %s", resultModel.StatusDescription)
 	}
 
-	// Return the deleted record information
-	return rInfo, nil
+	return nil
 }
 
 // performPostRequest sends a POST request to the specified URL with query parameters and returns the HTTP response or an error.
